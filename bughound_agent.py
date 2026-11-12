@@ -86,7 +86,7 @@ class BugHoundAgent:
         issues = self._parse_json_array_of_issues(raw)
 
         if issues is None:
-            self._log("ANALYZE", "LLM output was not parseable JSON. Falling back to heuristics.")
+            self._log("ANALYZE", "LLM output could not be validated. Falling back to heuristics.")
             return self._heuristic_analyze(code_snippet)
 
         return issues
@@ -177,29 +177,66 @@ class BugHoundAgent:
         text = text.strip()
         parsed = self._try_json_loads(text)
         if isinstance(parsed, list):
-            return self._normalize_issues(parsed)
+            return self._validate_and_log_issues(parsed)
 
         array_str = self._extract_first_json_array(text)
         if array_str:
             parsed2 = self._try_json_loads(array_str)
             if isinstance(parsed2, list):
-                return self._normalize_issues(parsed2)
+                return self._validate_and_log_issues(parsed2)
 
         return None
 
-    def _normalize_issues(self, arr: List[Any]) -> List[Dict[str, str]]:
-        issues: List[Dict[str, str]] = []
-        for item in arr:
-            if not isinstance(item, dict):
-                continue
-            issues.append(
-                {
-                    "type": str(item.get("type", "Issue")),
-                    "severity": str(item.get("severity", "Unknown")),
-                    "msg": str(item.get("msg", "")).strip(),
-                }
+    _SEVERITY_CANONICAL = {"low": "Low", "medium": "Medium", "high": "High"}
+
+    def _validate_issue(self, item: Any) -> Optional[Dict[str, str]]:
+        if not isinstance(item, dict):
+            return None
+
+        raw_type = item.get("type")
+        raw_msg = item.get("msg")
+        raw_severity = item.get("severity")
+        if raw_type is None or raw_msg is None or raw_severity is None:
+            return None
+
+        type_str = str(raw_type).strip()
+        msg_str = str(raw_msg).strip()
+        if not type_str or not msg_str:
+            return None
+
+        canonical_severity = self._SEVERITY_CANONICAL.get(str(raw_severity).strip().lower())
+        if canonical_severity is None:
+            return None
+
+        return {"type": type_str, "severity": canonical_severity, "msg": msg_str}
+
+    def _validate_issues_array(self, arr: List[Any]) -> Tuple[List[Dict[str, str]], int, int]:
+        seen = len(arr)
+        valid = [v for v in (self._validate_issue(item) for item in arr) if v is not None]
+        return valid, seen, seen - len(valid)
+
+    def _validate_and_log_issues(self, arr: List[Any]) -> Optional[List[Dict[str, str]]]:
+        valid, seen, dropped = self._validate_issues_array(arr)
+
+        if seen == 0:
+            # Legitimate "no issues found" response.
+            return valid
+
+        if not valid:
+            self._log(
+                "ANALYZE",
+                f"LLM returned {seen} issue(s) but all failed validation against the "
+                f"analyzer contract. Treating as unusable.",
             )
-        return issues
+            return None
+
+        if dropped:
+            self._log(
+                "ANALYZE",
+                f"LLM returned {seen} issue(s), {dropped} dropped for failing validation.",
+            )
+
+        return valid
 
     def _try_json_loads(self, s: str) -> Any:
         try:
@@ -229,7 +266,7 @@ class BugHoundAgent:
         return text
 
     def _can_call_llm(self) -> bool:
-        return self.client is not None and hasattr(self.client, "complete")
+        return self.client is not None and callable(getattr(self.client, "complete", None))
 
     def _log(self, step: str, message: str) -> None:
         self.logs.append({"step": step, "message": message})
